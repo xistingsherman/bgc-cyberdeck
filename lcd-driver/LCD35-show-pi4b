@@ -1,0 +1,239 @@
+#!/bin/bash
+#
+# LCD35-show-pi4b -- 3.5" GPIO/SPI TFT installer for the Raspberry Pi 4 Model B.
+#
+# This is LCD35-show with the Pi-4-specific bits fixed. Run it from the same
+# folder, because it still needs ./usr, ./boot, ./etc and ./system_config.sh
+# out of the LCD-show checkout:
+#
+#     chmod +x LCD35-show-pi4b
+#     sudo ./LCD35-show-pi4b          # 90 degree rotation (landscape)
+#     sudo ./LCD35-show-pi4b 180      # any rotation rotate.sh understands
+#
+# What changed from LCD35-show, and why:
+#
+#   * config.txt moved to /boot/firmware on Bookworm and newer. Writing to
+#     /boot/config.txt on those releases edits a file the firmware never reads,
+#     which is the usual reason "nothing happened after reboot".
+#   * The Pi 4 has two HDMI ports, so the hdmi_* keys need a :0 suffix to mean
+#     "the first port". Without it the firmware ignores them.
+#   * fbcp copies fb0 into fb1, and the Pi 4 only makes a second framebuffer if
+#     you ask for one -- max_framebuffers=2.
+#   * fbcp cannot read from the full KMS driver, so we switch vc4-kms-v3d over
+#     to vc4-fkms-v3d.
+#   * The settings go into a marked block that is rewritten on every run, so
+#     running this twice does not stack up duplicate lines the way blindly
+#     appending to config.txt does.
+
+# --- work out where we are running ------------------------------------------
+
+model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)
+echo "board: ${model:-unknown}"
+
+case "$model" in
+*"Raspberry Pi 4"*)
+;;
+*)
+echo -e "\033[31mThis script is written for the Raspberry Pi 4 Model B.\033[0m"
+echo -e "\033[31mOn any other board use LCD35-show instead.\033[0m"
+read -r -p "Continue anyway? [y/N] " reply
+case "$reply" in
+[yY]*) ;;
+*) echo "stopping"; exit 1 ;;
+esac
+;;
+esac
+
+# Bookworm (Debian 12) and newer mount the firmware partition at /boot/firmware.
+if [ -f /boot/firmware/config.txt ]; then
+boot_dir=/boot/firmware
+else
+boot_dir=/boot
+fi
+config_txt=$boot_dir/config.txt
+overlay_dir=$boot_dir/overlays
+echo "boot config: $config_txt"
+
+if [ ! -f "$config_txt" ]; then
+echo -e "\033[31mcannot find config.txt, is this a Raspberry Pi OS install?\033[0m"
+exit 1
+fi
+
+# system_config.sh sets deb_version, username and hardware_arch. Work them out
+# ourselves if it is not sitting next to us, so the script still runs.
+if [ -f ./system_config.sh ]; then
+source ./system_config.sh
+fi
+if [ -z "$deb_version" ]; then
+deb_version=$(cat /etc/debian_version 2>/dev/null)
+fi
+if [ -z "$username" ]; then
+username=${SUDO_USER:-$(logname 2>/dev/null || echo pi)}
+fi
+if [ -z "$hardware_arch" ]; then
+hardware_arch=$(getconf LONG_BIT)
+fi
+deb_major=${deb_version%%.*}
+echo "debian: $deb_version   user: $username   arch: ${hardware_arch}-bit"
+
+# --- back up first ----------------------------------------------------------
+
+if [ -f ./system_backup.sh ]; then
+sudo ./system_backup.sh
+fi
+sudo cp -f "$config_txt" "$config_txt.lcd35-pi4b.bak"
+echo "saved a copy of config.txt to $config_txt.lcd35-pi4b.bak"
+
+# --- device tree overlay ----------------------------------------------------
+
+sudo cp ./usr/tft35a-overlay.dtb "$overlay_dir/"
+sudo cp ./usr/tft35a-overlay.dtb "$overlay_dir/tft35a.dtbo"
+
+# --- config.txt -------------------------------------------------------------
+
+marker_begin="# --- LCD35-show-pi4b begin, do not edit inside this block ---"
+marker_end="# --- LCD35-show-pi4b end ---"
+
+# Drop anything an earlier run of this script left behind.
+sudo sed -i "\|^$marker_begin$|,\|^$marker_end$|d" "$config_txt"
+
+# fbcp reads fb0, which the full KMS driver does not keep up to date. Fake KMS
+# still gives you a working framebuffer, so downgrade any vc4-kms-v3d line.
+sudo sed -i -e 's/^[[:space:]]*dtoverlay=vc4-kms-v3d/#dtoverlay=vc4-kms-v3d/' "$config_txt"
+
+sudo tee -a "$config_txt" > /dev/null <<EOF
+$marker_begin
+[all]
+dtparam=i2c_arm=on
+dtparam=spi=on
+enable_uart=1
+
+# fake KMS, so fbcp has an fb0 it can read
+dtoverlay=vc4-fkms-v3d
+
+# the second framebuffer fbcp copies into -- the Pi 4 makes only one by default
+max_framebuffers=2
+
+dtoverlay=tft35a:rotate=90
+
+# :0 means HDMI0. The Pi 4 has two ports, so unsuffixed hdmi_* keys are ignored.
+hdmi_force_hotplug:0=1
+hdmi_group:0=2
+hdmi_mode:0=87
+hdmi_cvt:0=480 320 60 6 0 0 0
+hdmi_drive:0=2
+$marker_end
+EOF
+
+echo "wrote the LCD settings into $config_txt"
+
+# --- X11 touch calibration --------------------------------------------------
+
+if [ -f /etc/X11/xorg.conf.d/40-libinput.conf ]; then
+sudo rm -rf /etc/X11/xorg.conf.d/40-libinput.conf
+fi
+sudo mkdir -p /etc/X11/xorg.conf.d
+sudo cp -rf ./usr/99-calibration.conf-35-90 /etc/X11/xorg.conf.d/99-calibration.conf
+
+if [ "$deb_major" -lt 12 ] 2>/dev/null; then
+sudo cp -rf ./usr/99-fbturbo.conf /usr/share/X11/xorg.conf.d/99-fbturbo.conf
+fi
+
+if [ "$deb_major" -ge 13 ] 2>/dev/null; then
+sudo cp -rf ./usr/99-fbturbo-fbcp.conf /usr/share/X11/xorg.conf.d/99-fbturbo.conf
+sudo cp -rf ./etc/.bash_profile /home/$username/
+fi
+
+if [ "$deb_major" -lt 13 ] 2>/dev/null; then
+sudo cp ./usr/inittab /etc/ 2>/dev/null
+fi
+
+sudo touch ./.have_installed
+echo "gpio:resistance:35:90:480:320" > ./.have_installed
+
+# Bookworm and Trixie boot straight into Wayland, which never reads the X11
+# files above and never draws into fb0 for fbcp to copy out.
+if [ "$deb_major" -ge 12 ] 2>/dev/null; then
+echo -e "\033[33m"
+echo "Heads up: Debian $deb_version defaults to Wayland."
+echo "The little screen will not mirror the desktop until you switch to X11:"
+echo "    sudo raspi-config  ->  Advanced Options  ->  Wayland  ->  X11"
+echo -e "\033[0m"
+fi
+
+# --- fbcp -------------------------------------------------------------------
+
+wget --spider -q -o /dev/null --tries=1 -T 10 https://cmake.org/
+if [ $? -eq 0 ]; then
+sudo apt-get install cmake libraspberrypi-dev -y 2> error_output.txt
+result=`cat ./error_output.txt`
+echo -e "\033[31m$result\033[0m"
+type cmake > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+sudo rm -rf rpi-fbcp
+wget --spider -q -o /dev/null --tries=1 -T 10 https://github.com
+if [ $? -eq 0 ]; then
+sudo git clone https://github.com/tasanakorn/rpi-fbcp
+if [ $? -ne 0 ]; then
+echo "download fbcp failed, copy native fbcp!!!"
+sudo cp -r ./usr/rpi-fbcp .
+fi
+else
+echo "bad network, copy native fbcp!!!"
+sudo cp -r ./usr/rpi-fbcp .
+fi
+sudo mkdir -p ./rpi-fbcp/build
+cd ./rpi-fbcp/build/
+sudo cmake ..
+sudo make
+sudo install fbcp /usr/local/bin/fbcp
+cd - > /dev/null
+type fbcp > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+if [ "$deb_major" -lt 12 ] 2>/dev/null; then
+sudo cp -rf ./usr/99-fbturbo-fbcp.conf /usr/share/X11/xorg.conf.d/99-fbturbo.conf
+fi
+sudo cp -rf ./etc/rc.local /etc/rc.local
+fi
+else
+echo "install cmake error!!!!"
+fi
+else
+echo "bad network, can't install cmake!!!"
+fi
+
+# --- touchscreen input driver -----------------------------------------------
+
+input_result=0
+sudo apt-get install xserver-xorg-input-evdev -y 2> error_output.txt
+dpkg -l | grep xserver-xorg-input-evdev > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+input_result=1
+fi
+if [ $input_result -eq 1 ]; then
+if [ "$hardware_arch" -eq 32 ]; then
+sudo dpkg -i -B ./xserver-xorg-input-evdev_1%3a2.10.6-1+b1_armhf.deb 2> error_output.txt
+elif [ "$hardware_arch" -eq 64 ]; then
+sudo dpkg -i -B ./xserver-xorg-input-evdev_1%3a2.10.6-2_arm64.deb 2> error_output.txt
+fi
+fi
+result=`cat ./error_output.txt`
+echo -e "\033[31m$result\033[0m"
+if [ -f /usr/share/X11/xorg.conf.d/10-evdev.conf ]; then
+sudo cp -rf /usr/share/X11/xorg.conf.d/10-evdev.conf /usr/share/X11/xorg.conf.d/45-evdev.conf
+fi
+
+# --- done -------------------------------------------------------------------
+
+sudo sync
+sudo sync
+sleep 1
+
+if [ $# -eq 1 ]; then
+sudo ./rotate.sh $1
+elif [ $# -gt 1 ]; then
+echo "Too many parameters"
+fi
+
+echo "reboot now"
+sudo reboot
