@@ -1,1 +1,6 @@
-lcd-driver/* text eol=lf
+# These are shell scripts that run on the Pi. CRLF endings make them fail at
+# exec with "bad interpreter: /bin/bash^M", and Windows editors and tooling
+# introduce them silently, so pin the endings explicitly.
+lcd-driver/LCD35-show      text eol=lf
+lcd-driver/LCD35-show-pi4b text eol=lf
+*.sh                       text eol=lf

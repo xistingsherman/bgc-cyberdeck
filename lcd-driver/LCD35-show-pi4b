@@ -51,9 +51,21 @@ DO_REBOOT=ask
 UNINSTALL=no
 TARGET_USER=""
 
+# The cyberdeck is driven from an external USB keyboard. squeekboard -- the
+# on-screen keyboard Raspberry Pi OS pops up once it sees a touchscreen --
+# would cover most of a 480x320 panel every time a text field takes focus,
+# so it is off by default here. Pass --keep-osk if you want it.
+DISABLE_OSK=yes
+
 BEGIN_MARK="# --- LCD35-show-pi4b begin ---"
 END_MARK="# --- LCD35-show-pi4b end ---"
 UDEV_RULE=/etc/udev/rules.d/99-touchscreen-calibration.rules
+
+# Prefix used to comment out the on-screen keyboard's autostart line. Kept
+# deliberately different from the LCD35-show-pi4b marker above: the autostart
+# cleanup below DELETES lines carrying that marker, which would throw the
+# squeekboard line away instead of restoring it on --uninstall.
+OSK_OFF="#OSKOFF#"
 
 red()  { echo -e "\033[31m$*\033[0m"; }
 warn() { echo -e "\033[33m$*\033[0m"; }
@@ -74,6 +86,8 @@ Options:
                      who ran sudo)
   --reboot           Reboot when finished without asking
   --no-reboot        Do not reboot, just print what to do next
+  --keep-osk         Leave the on-screen keyboard alone (it is disabled by
+                     default, on the assumption you have a USB keyboard)
   --uninstall        Remove everything this script installs
   -h, --help         Show this help
 EOF
@@ -89,6 +103,7 @@ while [ $# -gt 0 ]; do
         --user)       TARGET_USER=${2:-}; shift 2 ;;
         --reboot)     DO_REBOOT=yes; shift ;;
         --no-reboot)  DO_REBOOT=no; shift ;;
+        --keep-osk)   DISABLE_OSK=no; shift ;;
         --uninstall)  UNINSTALL=yes; shift ;;
         -h|--help)    usage; exit 0 ;;
         *)            red "unknown option: $1"; echo; usage; exit 1 ;;
@@ -182,13 +197,75 @@ strip_config_block() {
     sed -i '\|^# --- LCD35-show-pi4b begin|,\|^# --- LCD35-show-pi4b end ---$|d' "$CONFIG_TXT"
 }
 
+# --- on-screen keyboard ------------------------------------------------------
+#
+# On Trixie the on-screen keyboard is squeekboard, and it can start two ways:
+# a launch line in the labwc autostart, and D-Bus activation, where the
+# compositor starts it on demand the moment a text field asks for input.
+# Turning off only the first leaves the second working, so both go.
+#
+# Both levers are per-user and reversible, and neither touches a system file.
+
+OSK_DBUS_NAME=sm.puri.OSK0
+osk_autostart() { echo "$USER_HOME/.config/labwc/autostart"; }
+osk_dbus_dir()  { echo "$USER_HOME/.local/share/dbus-1/services"; }
+
+disable_osk() {
+    local autostart dbus_dir touched=no
+    autostart=$(osk_autostart)
+    dbus_dir=$(osk_dbus_dir)
+
+    # Comment out any squeekboard launch line. The pattern will not match a
+    # line that already carries the prefix, so re-running this is safe.
+    if [ -f "$autostart" ] && grep -qE '^[[:space:]]*squeekboard' "$autostart"; then
+        sed -i "/^[[:space:]]*squeekboard/s|^|$OSK_OFF|" "$autostart"
+        echo "  commented out the squeekboard line in $autostart"
+        touched=yes
+    fi
+
+    # Shadow the D-Bus activation file with one that starts nothing. A file in
+    # the user's services directory wins over /usr/share/dbus-1/services.
+    if [ -f "/usr/share/dbus-1/services/$OSK_DBUS_NAME.service" ]; then
+        mkdir -p "$dbus_dir"
+        cat > "$dbus_dir/$OSK_DBUS_NAME.service" <<EOF
+# Shadows the system $OSK_DBUS_NAME.service so the on-screen keyboard is never
+# started on demand. Written by LCD35-show-pi4b, removed by --uninstall.
+[D-BUS Service]
+Name=$OSK_DBUS_NAME
+Exec=/bin/true
+EOF
+        chown -R "$TARGET_USER": "$USER_HOME/.local/share/dbus-1"
+        echo "  shadowed $OSK_DBUS_NAME D-Bus activation in $dbus_dir"
+        touched=yes
+    fi
+
+    if [ "$touched" = yes ]; then
+        ok "disabled the on-screen keyboard"
+    else
+        warn "found no on-screen keyboard to disable -- if one still appears,"
+        warn "turn it off in Raspberry Pi Configuration > Display > Screen Keyboard"
+    fi
+}
+
+restore_osk() {
+    local autostart dbus_dir
+    autostart=$(osk_autostart)
+    dbus_dir=$(osk_dbus_dir)
+    if [ -f "$autostart" ]; then
+        sed -i "s|^$OSK_OFF||" "$autostart"
+    fi
+    rm -f "$dbus_dir/$OSK_DBUS_NAME.service"
+}
+
 if [ "$UNINSTALL" = yes ]; then
     cp -f "$CONFIG_TXT" "$CONFIG_TXT.lcd35-pi4b.bak"
     strip_config_block
     rm -f "$UDEV_RULE"
     autostart=$USER_HOME/.config/labwc/autostart
     [ -f "$autostart" ] && sed -i '/LCD35-show-pi4b/d' "$autostart"
-    ok "removed the config block, the udev rule and the autostart line"
+    restore_osk
+    ok "removed the config block, the udev rule and the autostart line,"
+    ok "and put the on-screen keyboard back"
     echo "a copy of the previous config.txt is at $CONFIG_TXT.lcd35-pi4b.bak"
     echo "reboot to finish backing it out"
     exit 0
@@ -250,21 +327,39 @@ if ! command -v wlr-randr > /dev/null 2>&1; then
     fi
 fi
 
-# labwc uses ~/.config/labwc/autostart INSTEAD of the system one when it
-# exists, so seed it from the system copy first. Skipping this step loses the
-# taskbar and desktop icons.
+# labwc runs BOTH /etc/xdg/labwc/autostart and the user's
+# ~/.config/labwc/autostart, so this file needs to contain nothing but our
+# rotation line.
+#
+# An earlier version of this script assumed the user file replaced the system
+# one and seeded it with a copy. It does not replace it -- both run -- so on
+# any Pi without an existing user autostart that seeding launched every
+# desktop component twice: two panels, two desktops, stacked on top of each
+# other. Do not reintroduce it.
 AUTOSTART_DIR=$USER_HOME/.config/labwc
 AUTOSTART=$AUTOSTART_DIR/autostart
 mkdir -p "$AUTOSTART_DIR"
-if [ ! -f "$AUTOSTART" ] && [ -f /etc/xdg/labwc/autostart ]; then
-    cp /etc/xdg/labwc/autostart "$AUTOSTART"
-    echo "seeded $AUTOSTART from the system default"
-fi
 touch "$AUTOSTART"
-sed -i '/LCD35-show-pi4b/d' "$AUTOSTART"
+
+# Clear out every rotation line, whether or not it carries our marker. The
+# previous cleanup matched the marker only, so a hand-added wlr-randr line
+# was invisible to it and survived each re-run -- leaving two rotation lines
+# racing each other at login. This script owns the rotation, so it owns all
+# of them.
+stale=$(grep -c -e 'LCD35-show-pi4b' -e 'wlr-randr' "$AUTOSTART" 2>/dev/null || true)
+sed -i -e '/LCD35-show-pi4b/d' -e '/wlr-randr/d' "$AUTOSTART"
+if [ "${stale:-0}" -gt 0 ]; then
+    echo "cleared $stale stale line(s) from $AUTOSTART"
+fi
 echo "wlr-randr --output SPI-1 --transform $TRANSFORM &  # LCD35-show-pi4b" >> "$AUTOSTART"
 chown -R "$TARGET_USER": "$AUTOSTART_DIR"
 ok "set the panel to --transform $TRANSFORM on login ($AUTOSTART)"
+
+if [ "$DISABLE_OSK" = yes ]; then
+    disable_osk
+else
+    echo "leaving the on-screen keyboard alone (--keep-osk)"
+fi
 
 # --- done -------------------------------------------------------------------
 
@@ -274,11 +369,19 @@ echo "Installed:"
 echo "  panel      ILI9486 over SPI at $SPEED Hz, as a DRM display"
 echo "  rotation   transform $TRANSFORM, applied at login"
 echo "  touch      libinput matrix $MATRIX"
+if [ "$DISABLE_OSK" = yes ]; then
+    echo "  keyboard   on-screen keyboard off, use the USB keyboard"
+else
+    echo "  keyboard   on-screen keyboard left as it was"
+fi
 echo
 echo "After rebooting, check that:"
 echo "  * the desktop appears on the panel, already the right way up"
 echo "  * taps land where you press, especially near the corners"
 echo "  * HDMI still works if you plug a monitor in"
+if [ "$DISABLE_OSK" = yes ]; then
+    echo "  * tapping a text box does NOT bring up an on-screen keyboard"
+fi
 echo
 echo "If the panel shows speckled noise or torn rows, the SPI clock is too"
 echo "high for your board -- re-run with a lower --speed."
