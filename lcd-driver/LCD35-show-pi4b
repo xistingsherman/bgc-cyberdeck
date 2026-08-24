@@ -1,239 +1,297 @@
 #!/bin/bash
 #
-# LCD35-show-pi4b -- 3.5" GPIO/SPI TFT installer for the Raspberry Pi 4 Model B.
+# LCD35-show-pi4b -- set up a 3.5" ILI9486 SPI touchscreen (ADS7846 resistive
+# touch) on a Raspberry Pi 4 Model B running Raspberry Pi OS Trixie.
 #
-# This is LCD35-show with the Pi-4-specific bits fixed. Run it from the same
-# folder, because it still needs ./usr, ./boot, ./etc and ./system_config.sh
-# out of the LCD-show checkout:
+#     sudo ./LCD35-show-pi4b                     # install with defaults
+#     sudo ./LCD35-show-pi4b --speed 32000000    # push the SPI clock
+#     sudo ./LCD35-show-pi4b --transform 90      # different screen rotation
+#     sudo ./LCD35-show-pi4b --uninstall         # take it all back out
 #
-#     chmod +x LCD35-show-pi4b
-#     sudo ./LCD35-show-pi4b          # 90 degree rotation (landscape)
-#     sudo ./LCD35-show-pi4b 180      # any rotation rotate.sh understands
+# This is a ground-up rewrite. It shares nothing but a name with the original
+# LCD35-show, which was written for Buster/Bullseye and does not work here:
 #
-# What changed from LCD35-show, and why:
+#   * fbcp mirrored the HDMI output onto the panel using dispmanx, which
+#     Raspberry Pi removed in Bookworm. fbcp cannot even be compiled on Trixie.
+#   * The legacy hdmi_group / hdmi_cvt / hdmi_drive keys it wrote are ignored
+#     under KMS, so forcing HDMI to 480x320 does nothing.
+#   * It swapped the KMS driver for the deprecated fkms one. On Trixie fkms
+#     loads but finds no display at all, leaving the Pi with no framebuffer.
 #
-#   * config.txt moved to /boot/firmware on Bookworm and newer. Writing to
-#     /boot/config.txt on those releases edits a file the firmware never reads,
-#     which is the usual reason "nothing happened after reboot".
-#   * The Pi 4 has two HDMI ports, so the hdmi_* keys need a :0 suffix to mean
-#     "the first port". Without it the firmware ignores them.
-#   * fbcp copies fb0 into fb1, and the Pi 4 only makes a second framebuffer if
-#     you ask for one -- max_framebuffers=2.
-#   * fbcp cannot read from the full KMS driver, so we switch vc4-kms-v3d over
-#     to vc4-fkms-v3d.
-#   * The settings go into a marked block that is rewritten on every run, so
-#     running this twice does not stack up duplicate lines the way blindly
-#     appending to config.txt does.
+# Instead this drives the panel as a real DRM/KMS display via the in-tree
+# piscreen overlay, so it is a genuine screen the compositor can draw to
+# rather than a copy of something else. Nothing else on the system needs to
+# change -- in particular vc4-kms-v3d is left alone, so HDMI keeps working.
+#
+# Everything it needs either ships with Raspberry Pi OS (the piscreen overlay)
+# or comes from apt (wlr-randr). There are no companion files to download.
 
-# --- work out where we are running ------------------------------------------
+set -u
+
+# --- defaults ---------------------------------------------------------------
+
+# SPI clock. A full 320x480 16-bit frame is ~2.5 Mbit, so 16 MHz gives about
+# 6-7 fps and 32 MHz roughly doubles it. Most of these boards are happy at
+# 32 MHz, some reach 48 or 64. If you see speckled noise, torn rows, flicker
+# or a dark panel, step back down a notch -- there is no damage risk in
+# trying a speed that is too high.
+SPEED=16000000
+
+# Screen rotation, passed to wlr-randr. The panel is natively portrait, so
+# 90 and 270 give the two landscape orientations.
+TRANSFORM=180
+
+# libinput calibration matrix mapping raw touch coordinates onto the rotated
+# screen. Least-squares fit over four averaged corner presses on the workshop
+# unit. If you change TRANSFORM you must re-measure this -- see "Recalibrating
+# the touchscreen" in the README.
+MATRIX="-1.190 0 1.091 0 1.187 -0.094"
+
+DO_REBOOT=ask
+UNINSTALL=no
+TARGET_USER=""
+
+BEGIN_MARK="# --- LCD35-show-pi4b begin ---"
+END_MARK="# --- LCD35-show-pi4b end ---"
+UDEV_RULE=/etc/udev/rules.d/99-touchscreen-calibration.rules
+
+red()  { echo -e "\033[31m$*\033[0m"; }
+warn() { echo -e "\033[33m$*\033[0m"; }
+ok()   { echo -e "\033[32m$*\033[0m"; }
+
+die()  { red "$*"; exit 1; }
+
+usage() {
+    sed -n '3,26p' "$0" | sed 's/^# \?//'
+    cat <<EOF
+
+Options:
+  --speed HZ         SPI clock for the panel (default $SPEED)
+  --transform DEG    Screen rotation: 0, 90, 180 or 270 (default $TRANSFORM)
+  --matrix "a b c d e f"
+                     libinput calibration matrix for the touchscreen
+  --user NAME        Which user's desktop config to write (default: the user
+                     who ran sudo)
+  --reboot           Reboot when finished without asking
+  --no-reboot        Do not reboot, just print what to do next
+  --uninstall        Remove everything this script installs
+  -h, --help         Show this help
+EOF
+}
+
+# --- arguments --------------------------------------------------------------
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --speed)      SPEED=${2:-}; shift 2 ;;
+        --transform)  TRANSFORM=${2:-}; shift 2 ;;
+        --matrix)     MATRIX=${2:-}; shift 2 ;;
+        --user)       TARGET_USER=${2:-}; shift 2 ;;
+        --reboot)     DO_REBOOT=yes; shift ;;
+        --no-reboot)  DO_REBOOT=no; shift ;;
+        --uninstall)  UNINSTALL=yes; shift ;;
+        -h|--help)    usage; exit 0 ;;
+        *)            red "unknown option: $1"; echo; usage; exit 1 ;;
+    esac
+done
+
+case "$TRANSFORM" in
+    0|90|180|270) ;;
+    *) die "--transform must be 0, 90, 180 or 270 (got '$TRANSFORM')" ;;
+esac
+
+case "$SPEED" in
+    ''|*[!0-9]*) die "--speed must be a number in Hz, e.g. 32000000 (got '$SPEED')" ;;
+esac
+
+if [ "$(echo "$MATRIX" | wc -w)" -ne 6 ]; then
+    die "--matrix needs exactly six numbers (got '$MATRIX')"
+fi
+
+# The default matrix was fitted at transform 180. Rotating the screen without
+# re-measuring leaves touch mapped to the old orientation, which is the most
+# confusing failure mode there is: the panel looks right and the taps do not.
+if [ "$TRANSFORM" != 180 ] && [ "$MATRIX" = "-1.190 0 1.091 0 1.187 -0.094" ]; then
+    warn "The built-in calibration matrix was measured at --transform 180."
+    warn "At --transform $TRANSFORM your taps will land in the wrong place until"
+    warn "you re-measure it -- see \"Recalibrating the touchscreen\" in the README."
+    read -r -p "Continue anyway? [y/N] " reply
+    case "$reply" in [yY]*) ;; *) echo "stopping"; exit 1 ;; esac
+fi
+
+# --- pre-flight -------------------------------------------------------------
+#
+# Every check that can fail happens here, before anything on disk is touched.
+# The first version of this script edited config.txt and then discovered its
+# other dependencies were missing, which left the Pi with a blank screen and
+# no way to see what had gone wrong. Nothing below this block is allowed to
+# fail halfway.
+
+[ "$(id -u)" -eq 0 ] || die "run this with sudo: sudo $0"
 
 model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)
-echo "board: ${model:-unknown}"
-
+echo "board:  ${model:-unknown}"
 case "$model" in
-*"Raspberry Pi 4"*)
-;;
-*)
-echo -e "\033[31mThis script is written for the Raspberry Pi 4 Model B.\033[0m"
-echo -e "\033[31mOn any other board use LCD35-show instead.\033[0m"
-read -r -p "Continue anyway? [y/N] " reply
-case "$reply" in
-[yY]*) ;;
-*) echo "stopping"; exit 1 ;;
-esac
-;;
+    *"Raspberry Pi 4"*) ;;
+    *) warn "This was written and tested on a Raspberry Pi 4 Model B."
+       warn "Other boards may need a different overlay or pin mapping."
+       read -r -p "Continue anyway? [y/N] " reply
+       case "$reply" in [yY]*) ;; *) echo "stopping"; exit 1 ;; esac ;;
 esac
 
-# Bookworm (Debian 12) and newer mount the firmware partition at /boot/firmware.
 if [ -f /boot/firmware/config.txt ]; then
-boot_dir=/boot/firmware
+    BOOT_DIR=/boot/firmware
+elif [ -f /boot/config.txt ]; then
+    BOOT_DIR=/boot
 else
-boot_dir=/boot
+    die "cannot find config.txt -- is this Raspberry Pi OS?"
 fi
-config_txt=$boot_dir/config.txt
-overlay_dir=$boot_dir/overlays
-echo "boot config: $config_txt"
+CONFIG_TXT=$BOOT_DIR/config.txt
+echo "config: $CONFIG_TXT"
 
-if [ ! -f "$config_txt" ]; then
-echo -e "\033[31mcannot find config.txt, is this a Raspberry Pi OS install?\033[0m"
-exit 1
-fi
-
-# system_config.sh sets deb_version, username and hardware_arch. Work them out
-# ourselves if it is not sitting next to us, so the script still runs.
-if [ -f ./system_config.sh ]; then
-source ./system_config.sh
-fi
-if [ -z "$deb_version" ]; then
 deb_version=$(cat /etc/debian_version 2>/dev/null)
-fi
-if [ -z "$username" ]; then
-username=${SUDO_USER:-$(logname 2>/dev/null || echo pi)}
-fi
-if [ -z "$hardware_arch" ]; then
-hardware_arch=$(getconf LONG_BIT)
-fi
 deb_major=${deb_version%%.*}
-echo "debian: $deb_version   user: $username   arch: ${hardware_arch}-bit"
-
-# --- back up first ----------------------------------------------------------
-
-if [ -f ./system_backup.sh ]; then
-sudo ./system_backup.sh
+echo "debian: ${deb_version:-unknown}"
+if [ "${deb_major:-0}" -lt 12 ] 2>/dev/null; then
+    warn "This targets Trixie (Debian 13). On Bullseye or older the original"
+    warn "LCD-show approach is the one that works -- this script is not it."
+    read -r -p "Continue anyway? [y/N] " reply
+    case "$reply" in [yY]*) ;; *) echo "stopping"; exit 1 ;; esac
 fi
-sudo cp -f "$config_txt" "$config_txt.lcd35-pi4b.bak"
-echo "saved a copy of config.txt to $config_txt.lcd35-pi4b.bak"
 
-# --- device tree overlay ----------------------------------------------------
+# Which user's desktop config are we writing? Not root's.
+if [ -z "$TARGET_USER" ]; then
+    TARGET_USER=${SUDO_USER:-}
+fi
+[ -n "$TARGET_USER" ] || die "cannot tell which user to configure -- pass --user NAME"
+USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+[ -n "$USER_HOME" ] && [ -d "$USER_HOME" ] || die "no home directory for user '$TARGET_USER'"
+echo "user:   $TARGET_USER ($USER_HOME)"
 
-sudo cp ./usr/tft35a-overlay.dtb "$overlay_dir/"
-sudo cp ./usr/tft35a-overlay.dtb "$overlay_dir/tft35a.dtbo"
+if [ "$UNINSTALL" = no ]; then
+    [ -f "$BOOT_DIR/overlays/piscreen.dtbo" ] \
+        || die "$BOOT_DIR/overlays/piscreen.dtbo is missing -- this overlay ships with Raspberry Pi OS, so something is wrong with the install"
+fi
+
+echo
+
+# --- uninstall --------------------------------------------------------------
+
+strip_config_block() {
+    # Matches this script's marker and the one the first version wrote.
+    sed -i '\|^# --- LCD35-show-pi4b begin|,\|^# --- LCD35-show-pi4b end ---$|d' "$CONFIG_TXT"
+}
+
+if [ "$UNINSTALL" = yes ]; then
+    cp -f "$CONFIG_TXT" "$CONFIG_TXT.lcd35-pi4b.bak"
+    strip_config_block
+    rm -f "$UDEV_RULE"
+    autostart=$USER_HOME/.config/labwc/autostart
+    [ -f "$autostart" ] && sed -i '/LCD35-show-pi4b/d' "$autostart"
+    ok "removed the config block, the udev rule and the autostart line"
+    echo "a copy of the previous config.txt is at $CONFIG_TXT.lcd35-pi4b.bak"
+    echo "reboot to finish backing it out"
+    exit 0
+fi
 
 # --- config.txt -------------------------------------------------------------
 
-marker_begin="# --- LCD35-show-pi4b begin, do not edit inside this block ---"
-marker_end="# --- LCD35-show-pi4b end ---"
+cp -f "$CONFIG_TXT" "$CONFIG_TXT.lcd35-pi4b.bak"
+echo "backed up config.txt to $CONFIG_TXT.lcd35-pi4b.bak"
 
-# Drop anything an earlier run of this script left behind.
-sudo sed -i "\|^$marker_begin$|,\|^$marker_end$|d" "$config_txt"
+# The first version of this script commented this line out to make room for
+# the deprecated fkms driver, which on Trixie leaves the Pi with no display
+# driver at all. If a previous run did that, put it back.
+if grep -qE '^[[:space:]]*#[[:space:]]*dtoverlay=vc4-kms-v3d' "$CONFIG_TXT"; then
+    warn "vc4-kms-v3d was commented out -- re-enabling it (the panel does not need it disabled)"
+    sed -i 's/^[[:space:]]*#[[:space:]]*dtoverlay=vc4-kms-v3d/dtoverlay=vc4-kms-v3d/' "$CONFIG_TXT"
+fi
 
-# fbcp reads fb0, which the full KMS driver does not keep up to date. Fake KMS
-# still gives you a working framebuffer, so downgrade any vc4-kms-v3d line.
-sudo sed -i -e 's/^[[:space:]]*dtoverlay=vc4-kms-v3d/#dtoverlay=vc4-kms-v3d/' "$config_txt"
+strip_config_block
 
-sudo tee -a "$config_txt" > /dev/null <<EOF
-$marker_begin
+cat >> "$CONFIG_TXT" <<EOF
+$BEGIN_MARK
 [all]
-dtparam=i2c_arm=on
 dtparam=spi=on
-enable_uart=1
 
-# fake KMS, so fbcp has an fb0 it can read
-dtoverlay=vc4-fkms-v3d
-
-# the second framebuffer fbcp copies into -- the Pi 4 makes only one by default
-max_framebuffers=2
-
-dtoverlay=tft35a:rotate=90
-
-# :0 means HDMI0. The Pi 4 has two ports, so unsuffixed hdmi_* keys are ignored.
-hdmi_force_hotplug:0=1
-hdmi_group:0=2
-hdmi_mode:0=87
-hdmi_cvt:0=480 320 60 6 0 0 0
-hdmi_drive:0=2
-$marker_end
+# 3.5" ILI9486 panel as a real DRM/KMS display. drm=1 selects the in-kernel
+# ili9486 driver rather than the staging fbtft one, which is what lets a
+# Wayland compositor treat it as a display instead of a dumb framebuffer.
+dtoverlay=piscreen,drm=1,speed=$SPEED
+$END_MARK
 EOF
+ok "wrote the panel overlay into $CONFIG_TXT"
 
-echo "wrote the LCD settings into $config_txt"
+# --- touchscreen calibration ------------------------------------------------
+#
+# The piscreen overlay advertises swapxy / invx / invy parameters for the
+# touch panel, but on Trixie they have no effect -- measured raw coordinates
+# are identical with and without them. Rotating the touch input in userspace
+# with a libinput calibration matrix does work, so that is what we use.
+#
+# Note that evtest always shows the raw, uncalibrated numbers: the matrix is
+# applied by libinput further up the stack. Test the calibration by using the
+# desktop, not by reading evtest.
 
-# --- X11 touch calibration --------------------------------------------------
+cat > "$UDEV_RULE" <<EOF
+# ADS7846 touch mapping for the 3.5" panel at --transform $TRANSFORM.
+# Least-squares fit over four averaged corner presses.
+SUBSYSTEM=="input", ATTRS{name}=="ADS7846 Touchscreen", ENV{LIBINPUT_CALIBRATION_MATRIX}="$MATRIX"
+EOF
+ok "wrote the touch calibration to $UDEV_RULE"
 
-if [ -f /etc/X11/xorg.conf.d/40-libinput.conf ]; then
-sudo rm -rf /etc/X11/xorg.conf.d/40-libinput.conf
-fi
-sudo mkdir -p /etc/X11/xorg.conf.d
-sudo cp -rf ./usr/99-calibration.conf-35-90 /etc/X11/xorg.conf.d/99-calibration.conf
+# --- screen rotation --------------------------------------------------------
 
-if [ "$deb_major" -lt 12 ] 2>/dev/null; then
-sudo cp -rf ./usr/99-fbturbo.conf /usr/share/X11/xorg.conf.d/99-fbturbo.conf
-fi
-
-if [ "$deb_major" -ge 13 ] 2>/dev/null; then
-sudo cp -rf ./usr/99-fbturbo-fbcp.conf /usr/share/X11/xorg.conf.d/99-fbturbo.conf
-sudo cp -rf ./etc/.bash_profile /home/$username/
-fi
-
-if [ "$deb_major" -lt 13 ] 2>/dev/null; then
-sudo cp ./usr/inittab /etc/ 2>/dev/null
-fi
-
-sudo touch ./.have_installed
-echo "gpio:resistance:35:90:480:320" > ./.have_installed
-
-# Bookworm and Trixie boot straight into Wayland, which never reads the X11
-# files above and never draws into fb0 for fbcp to copy out.
-if [ "$deb_major" -ge 12 ] 2>/dev/null; then
-echo -e "\033[33m"
-echo "Heads up: Debian $deb_version defaults to Wayland."
-echo "The little screen will not mirror the desktop until you switch to X11:"
-echo "    sudo raspi-config  ->  Advanced Options  ->  Wayland  ->  X11"
-echo -e "\033[0m"
+if ! command -v wlr-randr > /dev/null 2>&1; then
+    echo "installing wlr-randr..."
+    if ! apt-get install -y wlr-randr > /dev/null 2>&1; then
+        warn "could not install wlr-randr -- the panel will come up portrait."
+        warn "run 'sudo apt install wlr-randr' once you have a network and re-run this."
+    fi
 fi
 
-# --- fbcp -------------------------------------------------------------------
-
-wget --spider -q -o /dev/null --tries=1 -T 10 https://cmake.org/
-if [ $? -eq 0 ]; then
-sudo apt-get install cmake libraspberrypi-dev -y 2> error_output.txt
-result=`cat ./error_output.txt`
-echo -e "\033[31m$result\033[0m"
-type cmake > /dev/null 2>&1
-if [ $? -eq 0 ]; then
-sudo rm -rf rpi-fbcp
-wget --spider -q -o /dev/null --tries=1 -T 10 https://github.com
-if [ $? -eq 0 ]; then
-sudo git clone https://github.com/tasanakorn/rpi-fbcp
-if [ $? -ne 0 ]; then
-echo "download fbcp failed, copy native fbcp!!!"
-sudo cp -r ./usr/rpi-fbcp .
+# labwc uses ~/.config/labwc/autostart INSTEAD of the system one when it
+# exists, so seed it from the system copy first. Skipping this step loses the
+# taskbar and desktop icons.
+AUTOSTART_DIR=$USER_HOME/.config/labwc
+AUTOSTART=$AUTOSTART_DIR/autostart
+mkdir -p "$AUTOSTART_DIR"
+if [ ! -f "$AUTOSTART" ] && [ -f /etc/xdg/labwc/autostart ]; then
+    cp /etc/xdg/labwc/autostart "$AUTOSTART"
+    echo "seeded $AUTOSTART from the system default"
 fi
-else
-echo "bad network, copy native fbcp!!!"
-sudo cp -r ./usr/rpi-fbcp .
-fi
-sudo mkdir -p ./rpi-fbcp/build
-cd ./rpi-fbcp/build/
-sudo cmake ..
-sudo make
-sudo install fbcp /usr/local/bin/fbcp
-cd - > /dev/null
-type fbcp > /dev/null 2>&1
-if [ $? -eq 0 ]; then
-if [ "$deb_major" -lt 12 ] 2>/dev/null; then
-sudo cp -rf ./usr/99-fbturbo-fbcp.conf /usr/share/X11/xorg.conf.d/99-fbturbo.conf
-fi
-sudo cp -rf ./etc/rc.local /etc/rc.local
-fi
-else
-echo "install cmake error!!!!"
-fi
-else
-echo "bad network, can't install cmake!!!"
-fi
-
-# --- touchscreen input driver -----------------------------------------------
-
-input_result=0
-sudo apt-get install xserver-xorg-input-evdev -y 2> error_output.txt
-dpkg -l | grep xserver-xorg-input-evdev > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-input_result=1
-fi
-if [ $input_result -eq 1 ]; then
-if [ "$hardware_arch" -eq 32 ]; then
-sudo dpkg -i -B ./xserver-xorg-input-evdev_1%3a2.10.6-1+b1_armhf.deb 2> error_output.txt
-elif [ "$hardware_arch" -eq 64 ]; then
-sudo dpkg -i -B ./xserver-xorg-input-evdev_1%3a2.10.6-2_arm64.deb 2> error_output.txt
-fi
-fi
-result=`cat ./error_output.txt`
-echo -e "\033[31m$result\033[0m"
-if [ -f /usr/share/X11/xorg.conf.d/10-evdev.conf ]; then
-sudo cp -rf /usr/share/X11/xorg.conf.d/10-evdev.conf /usr/share/X11/xorg.conf.d/45-evdev.conf
-fi
+touch "$AUTOSTART"
+sed -i '/LCD35-show-pi4b/d' "$AUTOSTART"
+echo "wlr-randr --output SPI-1 --transform $TRANSFORM &  # LCD35-show-pi4b" >> "$AUTOSTART"
+chown -R "$TARGET_USER": "$AUTOSTART_DIR"
+ok "set the panel to --transform $TRANSFORM on login ($AUTOSTART)"
 
 # --- done -------------------------------------------------------------------
 
-sudo sync
-sudo sync
-sleep 1
+sync
+echo
+echo "Installed:"
+echo "  panel      ILI9486 over SPI at $SPEED Hz, as a DRM display"
+echo "  rotation   transform $TRANSFORM, applied at login"
+echo "  touch      libinput matrix $MATRIX"
+echo
+echo "After rebooting, check that:"
+echo "  * the desktop appears on the panel, already the right way up"
+echo "  * taps land where you press, especially near the corners"
+echo "  * HDMI still works if you plug a monitor in"
+echo
+echo "If the panel shows speckled noise or torn rows, the SPI clock is too"
+echo "high for your board -- re-run with a lower --speed."
+echo
+echo "To undo everything: sudo $0 --uninstall"
+echo
 
-if [ $# -eq 1 ]; then
-sudo ./rotate.sh $1
-elif [ $# -gt 1 ]; then
-echo "Too many parameters"
-fi
-
-echo "reboot now"
-sudo reboot
+case "$DO_REBOOT" in
+    yes) echo "rebooting"; reboot ;;
+    no)  echo "reboot when you are ready for the changes to take effect" ;;
+    *)   read -r -p "Reboot now? [y/N] " reply
+         case "$reply" in
+             [yY]*) echo "rebooting"; reboot ;;
+             *) echo "reboot when you are ready for the changes to take effect" ;;
+         esac ;;
+esac
