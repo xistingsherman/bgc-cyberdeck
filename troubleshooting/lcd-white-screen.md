@@ -207,16 +207,49 @@ looking in the wrong place.
 
 ### Touch does nothing, and a monitor is plugged in
 
-With more than one output, wlroots spreads the touchscreen's coordinate space
-across the **whole desktop** unless it is told which output the panel is. With
-HDMI connected that puts every tap somewhere out on the monitor -- the panel
-looks perfect and responds to nothing.
+Check this before assuming anything is broken, because the most likely answer
+is that nothing is.
 
-Confirm it by unplugging HDMI and rebooting. If touch works with the monitor
-gone, this is it.
+**With a monitor connected, labwc extends the desktop -- it does not mirror
+it.** The panel becomes a small extra screen holding its own corner of the
+desktop, with no taskbar, no icons and no windows on it. Tapping empty desktop
+does nothing visible, which is indistinguishable from a dead touchscreen.
 
-The fix is a `<touch>` element in labwc's `rc.xml` binding the device to the
-panel's output:
+`wlr-randr` shows the layout:
+
+```
+HDMI-A-2 ...
+  Position: 480,0          <- the monitor, 2560x1440
+SPI-1 ...
+  Position: 0,0            <- the panel, 480x320, empty
+```
+
+**Prove touch is alive** before chasing it any further:
+
+```bash
+sudo libinput debug-events | grep -i touch
+```
+
+Press the panel. `TOUCH_DOWN` / `TOUCH_MOTION` / `TOUCH_UP` lines mean the
+panel, SPI, ADS7846, its interrupt and libinput are all working. `calib` in the
+`DEVICE_ADDED` line means your calibration matrix was picked up too. If you see
+those, nothing below the compositor is wrong and the problem is only about
+where the events land.
+
+**Then drag a window onto the panel** -- grab a terminal's titlebar on the
+monitor and pull it off the left edge until it appears on the LCD. Tap it. If
+it responds, touch was working the whole time and there was simply nothing on
+the panel to touch.
+
+Unplugging HDMI also "fixes" it, for the same reason: the panel becomes the
+only output, so the real desktop lands on it.
+
+If taps do reach the panel but land in the wrong place, that is the separate
+mapping problem below.
+
+Separately from all that, a touchscreen on a multi-output desktop has to be
+told which output it belongs to, or wlroots spreads its coordinate space across
+every screen. That is what the `<touch>` element in labwc's `rc.xml` does:
 
 ```xml
 <touch deviceName="ADS7846 Touchscreen" mapToOutput="SPI-1" mouseEmulation="no"/>
