@@ -12,8 +12,9 @@
 # do the same thing by the same method and are kept apart only so each can be
 # gated to the board it was actually tested on.
 #
-# This file used to hold the upstream goodtft LCD35-show, written for
-# Buster/Bullseye, which cannot work on Trixie: it wrote /boot/config.txt
+# This file used to hold the upstream goodtft LCD35-show, from
+# https://github.com/goodtft/LCD-show/blob/master/LCD35-show -- written for
+# Buster/Bullseye, and unable to work on Trixie: it wrote /boot/config.txt
 # rather than /boot/firmware/config.txt, shipped an overlay compiled against
 # the BCM2835/2711 device tree, and relied on fbcp, which needs the dispmanx
 # stack Raspberry Pi removed in Bookworm and the Pi 5 never had at all. The
@@ -24,6 +25,11 @@
 # piscreen overlay, so it is a genuine screen the compositor can draw to
 # rather than a copy of something else. vc4-kms-v3d is left alone, so both of
 # the Pi 5's HDMI ports keep working.
+#
+# It also binds touch input to the panel's output. With a second display
+# attached, an unbound touchscreen spreads its coordinates across the whole
+# desktop, so every tap lands out on the monitor and the panel looks perfect
+# while responding to nothing.
 #
 # Everything it needs either ships with Raspberry Pi OS (the piscreen overlay)
 # or comes from apt (wlr-randr). There are no companion files to download --
@@ -70,6 +76,10 @@ BEGIN_MARK="# --- LCD35-show begin ---"
 END_MARK="# --- LCD35-show end ---"
 UDEV_RULE=/etc/udev/rules.d/99-touchscreen-calibration.rules
 
+# labwc's rc.xml, resolved once $USER_HOME is known in pre-flight.
+RC_XML=""
+SYS_RC_XML=/etc/xdg/labwc/rc.xml
+
 # Prefix used to comment out the on-screen keyboard's autostart line. Kept
 # deliberately different from the marker above: the autostart cleanup below
 # DELETES lines carrying that marker, which would throw the squeekboard line
@@ -84,7 +94,7 @@ ok()   { echo -e "\033[32m$*\033[0m"; }
 die()  { red "$*"; exit 1; }
 
 usage() {
-    sed -n '3,31p' "$0" | sed 's/^# \?//'
+    sed -n '3,37p' "$0" | sed 's/^# \?//'
     cat <<EOF
 
 Options:
@@ -203,6 +213,7 @@ fi
 USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ] || die "no home directory for user '$TARGET_USER'"
 echo "user:   $TARGET_USER ($USER_HOME)"
+RC_XML=$USER_HOME/.config/labwc/rc.xml
 
 if [ "$UNINSTALL" = no ]; then
     [ -f "$BOOT_DIR/overlays/piscreen.dtbo" ] \
@@ -221,6 +232,74 @@ strip_config_block() {
     # Both scripts write dtparam=spi=on and dtoverlay=piscreen, and two copies
     # of those in config.txt is at best redundant. Only one owns the block.
     sed -i '\|^# --- LCD35-show-pi4b begin|,\|^# --- LCD35-show-pi4b end ---$|d' "$CONFIG_TXT"
+}
+
+# --- touch-to-output mapping ------------------------------------------------
+#
+# With more than one output, wlroots spreads a touchscreen's coordinate space
+# across the whole desktop unless it is told which output the panel is. With
+# HDMI plugged in that puts every tap out on the monitor, so the panel looks
+# perfect and responds to nothing -- a symptom that reads as a dead digitiser
+# and sends you hunting for a driver fault that is not there.
+#
+# labwc reads ONE rc.xml: the user's if it exists, otherwise the system one.
+# They are NOT merged -- the opposite of autostart, where both files run. So
+# writing a bare user rc.xml would silently discard the ~170 lines Raspberry
+# Pi OS ships in /etc/xdg/labwc/rc.xml, trading a dead touchscreen for a
+# subtly broken desktop. Always seed from the system file.
+
+strip_rc_block() {
+    [ -f "$RC_XML" ] || return 0
+    sed -i '\|^[[:space:]]*<!-- LCD35-show begin -->|,\|^[[:space:]]*<!-- LCD35-show end -->|d' "$RC_XML"
+}
+
+write_rc_touch() {
+    mkdir -p "$(dirname "$RC_XML")"
+
+    if [ ! -f "$RC_XML" ]; then
+        if [ -f "$SYS_RC_XML" ]; then
+            cp -f "$SYS_RC_XML" "$RC_XML"
+            echo "  seeded $RC_XML from $SYS_RC_XML"
+        else
+            # Nothing to preserve. labwc still applies its own built-in
+            # defaults for everything this file does not mention.
+            printf '%s\n' '<?xml version="1.0"?>' '<labwc_config>' '</labwc_config>' > "$RC_XML"
+            echo "  created a minimal $RC_XML"
+        fi
+    fi
+
+    strip_rc_block
+
+    if ! grep -q '</labwc_config>' "$RC_XML"; then
+        warn "no </labwc_config> in $RC_XML -- not adding the touch mapping."
+        warn "add this inside <labwc_config> by hand, or taps will land on the"
+        warn "monitor instead of the panel whenever HDMI is connected:"
+        warn '  <touch deviceName="ADS7846 Touchscreen" mapToOutput="SPI-1"/>'
+        return 0
+    fi
+
+    # Insert before the closing tag. 'inroot' keeps a </labwc_config> that
+    # appears before the root element opens -- in a header comment, say --
+    # from placing the block outside the root and producing invalid XML.
+    # 'done' stops a second, later match producing a second block.
+    #
+    # These markers deliberately drop the '---' used by the config.txt
+    # block: an XML comment may not contain '--' anywhere, and libxml2
+    # rejects the whole file if it does. That would make labwc discard
+    # every setting in rc.xml, not just ours.
+    awk '
+        /<labwc_config/ { inroot = 1 }
+        /<\/labwc_config>/ && inroot && !done {
+            print "<!-- LCD35-show begin -->"
+            print "  <touch deviceName=\"ADS7846 Touchscreen\" mapToOutput=\"SPI-1\" mouseEmulation=\"no\"/>"
+            print "<!-- LCD35-show end -->"
+            done = 1
+        }
+        { print }
+    ' "$RC_XML" > "$RC_XML.lcd35.tmp" && mv -f "$RC_XML.lcd35.tmp" "$RC_XML"
+
+    chown -R "$TARGET_USER": "$USER_HOME/.config/labwc"
+    ok "bound touch input to SPI-1 ($RC_XML)"
 }
 
 # --- on-screen keyboard ------------------------------------------------------
@@ -289,6 +368,13 @@ if [ "$UNINSTALL" = yes ]; then
     rm -f "$UDEV_RULE"
     autostart=$USER_HOME/.config/labwc/autostart
     [ -f "$autostart" ] && sed -i '/LCD35-show/d' "$autostart"
+    strip_rc_block
+    # If stripping our block leaves a file identical to the system one, it was
+    # only ever a seeded copy. Remove it so labwc goes back to reading the
+    # system file and picks up future OS updates to it.
+    if [ -f "$RC_XML" ] && [ -f "$SYS_RC_XML" ] && cmp -s "$RC_XML" "$SYS_RC_XML"; then
+        rm -f "$RC_XML"
+    fi
     restore_osk
     ok "removed the config block, the udev rule and the autostart line,"
     ok "and put the on-screen keyboard back"
@@ -386,6 +472,8 @@ echo "wlr-randr --output SPI-1 --transform $TRANSFORM &  # LCD35-show" >> "$AUTO
 chown -R "$TARGET_USER": "$AUTOSTART_DIR"
 ok "set the panel to --transform $TRANSFORM on login ($AUTOSTART)"
 
+write_rc_touch
+
 if [ "$DISABLE_OSK" = yes ]; then
     disable_osk
 else
@@ -400,6 +488,8 @@ echo "Installed:"
 echo "  panel      ILI9486 over SPI at $SPEED Hz, as a DRM display"
 echo "  rotation   transform $TRANSFORM, applied at login"
 echo "  touch      libinput matrix $MATRIX"
+echo "  touch map  bound to output SPI-1, so taps land on the panel even"
+echo "             when a monitor is connected"
 if [ "$DISABLE_OSK" = yes ]; then
     echo "  keyboard   on-screen keyboard off, use the USB keyboard"
 else

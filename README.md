@@ -77,6 +77,32 @@ The cyberdeck's little screen is an ILI9486 panel that plugs onto the GPIO heade
 talks to the Pi over SPI. On Raspberry Pi OS Trixie it's driven by the `piscreen`
 overlay, which ships with the OS — you don't need to download a driver for it.
 
+### Setting it up
+
+There are two installer scripts in `lcd-driver/`, one per board. Run them with `./`,
+never with `sh`:
+
+| Board | Script |
+|---|---|
+| Raspberry Pi 5 | `sudo ./LCD35-show --speed 32000000` |
+| Raspberry Pi 4 Model B | `sudo ./LCD35-show-pi4b --speed 32000000` |
+
+Check which board you have with `cat /proc/device-tree/model`. Either script backs up
+`config.txt` first and can be undone with `--uninstall`.
+
+Both started life as the goodtft driver script at
+<https://github.com/goodtft/LCD-show/blob/master/LCD35-show>, which is what most guides
+for these panels still point you at. That version was written for Raspberry Pi OS
+Buster/Bullseye and does not work on a Pi 5 running Trixie — it writes the pre-Bookworm
+`/boot/config.txt` path, ships a device tree overlay compiled for an older SoC, and
+depends on `fbcp`, which needs a firmware graphics stack the Pi 5 does not have. Running
+it gets you a blank white screen.
+
+The scripts here have been rewritten for this workshop: same panel, same wiring, but
+driven as a real DRM/KMS display through the in-tree `piscreen` overlay. If you hit a
+white screen or a dead touchscreen, `troubleshooting/lcd-white-screen.md` has the full
+account.
+
 ### Careful: the LCD isn't always `/dev/fb0`
 
 Linux calls each screen a **framebuffer** and numbers them `/dev/fb0`, `/dev/fb1`, and so

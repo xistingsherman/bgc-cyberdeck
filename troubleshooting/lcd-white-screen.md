@@ -116,10 +116,13 @@ looks like the wall of syntax errors above. Either way, run them as
 
 ## If you ran the old upstream `LCD35-show`
 
-`lcd-driver/LCD35-show` used to hold the upstream goodtft script, written for
-Buster/Bullseye. It is in git history if you need it. It cannot work on Trixie,
-for five independent reasons -- worth knowing, because the same reasoning
-applies to every other LCD-show fork you will find online.
+`lcd-driver/LCD35-show` used to hold the upstream goodtft script, from
+<https://github.com/goodtft/LCD-show/blob/master/LCD35-show>, which is still what
+most guides for these panels point you at. It is in this repo's git history too.
+
+It was written for Buster/Bullseye and cannot work on Trixie, for five
+independent reasons -- worth knowing, because the same reasoning applies to
+every other LCD-show fork you will find online.
 
 **It writes the wrong `config.txt`.** It does
 `cp -rf ./boot/config.txt.bak /boot/config.txt`. Since Bookworm the firmware
@@ -194,16 +197,61 @@ by hand.
 
 ---
 
-## Once the picture works but the taps do not
+## The picture works but touch does not
 
-The panel drawing correctly while touches land somewhere else is a separate
-problem -- the calibration matrix, not the driver. The matrix baked into both
+Two different causes that look alike. Check the first one first: it presents as
+a completely dead touchscreen, which reads as a hardware fault and sends you
+looking in the wrong place.
+
+### Touch does nothing, and a monitor is plugged in
+
+With more than one output, wlroots spreads the touchscreen's coordinate space
+across the **whole desktop** unless it is told which output the panel is. With
+HDMI connected that puts every tap somewhere out on the monitor -- the panel
+looks perfect and responds to nothing.
+
+Confirm it by unplugging HDMI and rebooting. If touch works with the monitor
+gone, this is it.
+
+The fix is a `<touch>` element in labwc's `rc.xml` binding the device to the
+panel's output:
+
+```xml
+<touch deviceName="ADS7846 Touchscreen" mapToOutput="SPI-1" mouseEmulation="no"/>
+```
+
+`LCD35-show` writes this for you. `LCD35-show-pi4b` does not, so on a Pi 4 it
+still has to be added by hand.
+
+Two things make that edit less simple than it looks, and both fail silently:
+
+- **labwc reads only ONE `rc.xml`** -- yours if it exists, otherwise
+  `/etc/xdg/labwc/rc.xml`. It does **not** merge them. That is the opposite of
+  `autostart`, where both files run. So a hand-written user `rc.xml` containing
+  just the `<touch>` line discards the ~170 lines Raspberry Pi OS ships in the
+  system file, trading a dead touchscreen for a subtly broken desktop. Copy the
+  system file first, then add the element to the copy.
+- **An XML comment may not contain `--` anywhere.** Marking your edit with
+  something like `<!-- --- mine --- -->` makes libxml2 reject the entire file,
+  and labwc falls back to built-in defaults -- losing every setting in it, not
+  just yours.
+
+`<touch>` is read when the compositor starts, so log out and back in. It does
+not apply live.
+
+### Taps land in the wrong place
+
+That is the calibration matrix, not the driver. The matrix baked into both
 scripts was fit on the workshop unit at `--transform 180`. It is a property of
 the panel rather than the board, so it carries between Pis with the same screen,
 but changing the rotation or swapping the panel means re-measuring. See
 "Recalibrating the touchscreen" in the README for the corner-press procedure.
 
+---
+
+## Speckled noise, torn rows or flicker
+
 Speckled noise, torn rows, flicker or a dark panel are a different problem
-again: the SPI clock is too fast for that board and ribbon. Re-run with a lower
+is the SPI clock running too fast for that board and ribbon. Re-run with a lower
 `--speed` (64 -> 48 -> 32 -> 24 MHz). There is no damage risk in trying a speed
 that is too high.
