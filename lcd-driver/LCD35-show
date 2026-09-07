@@ -56,11 +56,20 @@ SPEED=16000000
 TRANSFORM=180
 
 # libinput calibration matrix mapping raw touch coordinates onto the rotated
-# screen. Least-squares fit over four averaged corner presses on the workshop
-# unit. This is a property of the panel, not the board, so it carries over
-# from the Pi 4 unit. If you change TRANSFORM you must re-measure it -- see
-# "Recalibrating the touchscreen" in the README.
-MATRIX="-1.190 0 1.091 0 1.187 -0.094"
+# screen. Verified on the workshop Pi 5 at --transform 180.
+#
+# This is a full 180 degrees from the matrix LCD35-show-pi4b carries, which was
+# fitted on the Pi 4 unit with the same panel. Both axes are inverted relative
+# to it. The likely reason is that the <touch mapToOutput> element written
+# below did not exist when the Pi 4 matrix was measured, and binding touch to a
+# specific output changes how the output's 180 degree transform is applied to
+# incoming coordinates. If you are setting up a Pi 4, check whether it now
+# needs these values too rather than assuming its old ones still hold.
+#
+# If you change TRANSFORM you must re-measure -- see "Recalibrating the
+# touchscreen" in the README, using the event number from
+# /proc/bus/input/devices rather than the one the README names.
+MATRIX="1.190 0 -0.091 0 -1.187 1.094"
 
 DO_REBOOT=ask
 UNINSTALL=no
@@ -150,7 +159,7 @@ fi
 # The default matrix was fitted at transform 180. Rotating the screen without
 # re-measuring leaves touch mapped to the old orientation, which is the most
 # confusing failure mode there is: the panel looks right and the taps do not.
-if [ "$TRANSFORM" != 180 ] && [ "$MATRIX" = "-1.190 0 1.091 0 1.187 -0.094" ]; then
+if [ "$TRANSFORM" != 180 ] && [ "$MATRIX" = "1.190 0 -0.091 0 -1.187 1.094" ]; then
     warn "The built-in calibration matrix was measured at --transform 180."
     warn "At --transform $TRANSFORM your taps will land in the wrong place until"
     warn "you re-measure it -- see \"Recalibrating the touchscreen\" in the README."

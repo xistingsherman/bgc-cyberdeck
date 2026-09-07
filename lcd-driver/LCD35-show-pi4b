@@ -48,7 +48,13 @@ TRANSFORM=180
 
 # libinput calibration matrix mapping raw touch coordinates onto the rotated
 # screen. Least-squares fit over four averaged corner presses on the workshop
-# unit. If you change TRANSFORM you must re-measure this -- see "Recalibrating
+# unit -- measured BEFORE this script gained the <touch mapToOutput> element.
+#
+# The Pi 5, with the same panel and the same --transform 180, needed both axes
+# inverted relative to this once that element was added: see the MATRIX comment
+# in LCD35-show. This value has not been re-checked on a Pi 4 since. If your
+# taps come out mirrored, try "1.190 0 -0.091 0 -1.187 1.094" before assuming
+# your panel needs its own measurement. If you change TRANSFORM you must re-measure this -- see "Recalibrating
 # the touchscreen" in the README.
 MATRIX="-1.190 0 1.091 0 1.187 -0.094"
 

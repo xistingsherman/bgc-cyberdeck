@@ -280,11 +280,45 @@ Three things make that edit less simple than it looks, and all fail silently:
 
 ### Taps land in the wrong place
 
-That is the calibration matrix, not the driver. The matrix baked into both
-scripts was fit on the workshop unit at `--transform 180`. It is a property of
-the panel rather than the board, so it carries between Pis with the same screen,
-but changing the rotation or swapping the panel means re-measuring. See
+That is the calibration matrix, not the driver. Each script carries one
+measured at `--transform 180`, and the two differ by a full 180 degrees:
+
+| Script | Matrix |
+|---|---|
+| `LCD35-show` (Pi 5) | `1.190 0 -0.091 0 -1.187 1.094` |
+| `LCD35-show-pi4b` (Pi 4) | `-1.190 0 1.091 0 1.187 -0.094` |
+
+Only the first is verified since the `<touch mapToOutput>` element was added.
+Binding touch to a specific output appears to change how that output's rotation
+is applied to incoming coordinates, so the Pi 4 value may now be stale too.
+
+Before measuring from scratch, try flipping axes -- a mirrored image is far more
+common than a genuinely mis-scaled one. For a matrix `a b c d e f`, negate `a`
+and replace `c` with `1 - c` to flip horizontally; negate `e` and replace `f`
+with `1 - f` to flip vertically:
+
+| | matrix |
+|---|---|
+| as measured on the Pi 4 | `-1.190 0 1.091 0 1.187 -0.094` |
+| flip Y (vertical) | `-1.190 0 1.091 0 -1.187 1.094` |
+| flip X (horizontal) | `1.190 0 -0.091 0 1.187 -0.094` |
+| flip both (180 degrees) | `1.190 0 -0.091 0 -1.187 1.094` |
+
+Test one without editing anything by hand:
+
+```bash
+sudo ./LCD35-show --matrix "1.190 0 -0.091 0 -1.187 1.094" --no-reboot
+sudo reboot
+```
+
+Reboot rather than just logging out: the matrix is applied by udev when the
+input device appears, so the device has to be re-added, not just the compositor
+restarted.
+
+If none of the four land cleanly, the panel wants a real measurement -- see
 "Recalibrating the touchscreen" in the README for the corner-press procedure.
+Use the event number from `/proc/bus/input/devices` rather than the one the
+README names; it is not stable across boots or configurations.
 
 ---
 
