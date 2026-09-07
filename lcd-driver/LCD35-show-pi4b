@@ -1,8 +1,7 @@
 #!/bin/bash
 #
 # LCD35-show-pi4b -- set up a 3.5" ILI9486 SPI touchscreen (ADS7846 resistive
-# touch) on a Raspberry Pi 4 Model B or a Raspberry Pi 5 running Raspberry
-# Pi OS Trixie.
+# touch) on a Raspberry Pi 4 Model B running Raspberry Pi OS Trixie.
 #
 #     sudo ./LCD35-show-pi4b                     # install with defaults
 #     sudo ./LCD35-show-pi4b --speed 32000000    # push the SPI clock
@@ -148,8 +147,8 @@ fi
 model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null)
 echo "board:  ${model:-unknown}"
 case "$model" in
-    *"Raspberry Pi 4"*|*"Raspberry Pi 5"*) ;;
-    *) warn "This was written and tested on a Raspberry Pi 4 Model B and a Pi 5."
+    *"Raspberry Pi 4"*) ;;
+    *) warn "This was written and tested on a Raspberry Pi 4 Model B."
        warn "Other boards may need a different overlay or pin mapping."
        read -r -p "Continue anyway? [y/N] " reply
        case "$reply" in [yY]*) ;; *) echo "stopping"; exit 1 ;; esac ;;
