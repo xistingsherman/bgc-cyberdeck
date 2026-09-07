@@ -273,10 +273,15 @@ write_rc_touch() {
 
     strip_rc_block
 
-    if ! grep -q '</labwc_config>' "$RC_XML"; then
-        warn "no </labwc_config> in $RC_XML -- not adding the touch mapping."
-        warn "add this inside <labwc_config> by hand, or taps will land on the"
-        warn "monitor instead of the panel whenever HDMI is connected:"
+    # labwc accepts either root element: <labwc_config> in its own docs, and
+    # <openbox_config xmlns="http://openbox.org/3.4/rc"> inherited from the
+    # openbox schema, which is what Raspberry Pi OS ships. Match both -- an
+    # earlier version looked only for </labwc_config> and so silently skipped
+    # the insert on a stock Pi OS config.
+    if ! grep -qE '</labwc_config>|</openbox_config>' "$RC_XML"; then
+        warn "no </labwc_config> or </openbox_config> in $RC_XML --"
+        warn "not adding the touch mapping. Add this inside the root element by"
+        warn "hand, or taps will land on the monitor whenever HDMI is connected:"
         warn '  <touch deviceName="ADS7846 Touchscreen" mapToOutput="SPI-1"/>'
         return 0
     fi
@@ -291,8 +296,8 @@ write_rc_touch() {
     # rejects the whole file if it does. That would make labwc discard
     # every setting in rc.xml, not just ours.
     awk '
-        /<labwc_config/ { inroot = 1 }
-        /<\/labwc_config>/ && inroot && !done {
+        /<labwc_config|<openbox_config/ { inroot = 1 }
+        /<\/labwc_config>|<\/openbox_config>/ && inroot && !done {
             print "<!-- LCD35-show begin -->"
             print "  <touch deviceName=\"ADS7846 Touchscreen\" mapToOutput=\"SPI-1\" mouseEmulation=\"no\"/>"
             print "<!-- LCD35-show end -->"

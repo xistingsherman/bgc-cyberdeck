@@ -225,7 +225,12 @@ panel's output:
 Both scripts write this for you. It is read when the compositor starts, so log
 out and back in after installing -- it does not apply live.
 
-Two things make that edit less simple than it looks, and both fail silently:
+Three things make that edit less simple than it looks, and all fail silently:
+
+- **The root element may be either `<labwc_config>` or `<openbox_config
+  xmlns="http://openbox.org/3.4/rc">`.** labwc accepts both -- the second is
+  inherited from openbox's schema. Whichever your `rc.xml` uses, the `<touch>`
+  element goes inside it.
 
 - **labwc reads only ONE `rc.xml`** -- yours if it exists, otherwise
   `/etc/xdg/labwc/rc.xml`. It does **not** merge them. That is the opposite of
