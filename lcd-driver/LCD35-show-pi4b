@@ -54,6 +54,10 @@ MATRIX="-1.190 0 1.091 0 1.187 -0.094"
 
 DO_REBOOT=ask
 UNINSTALL=no
+# Set by write_rc_touch. The summary at the end must report what actually
+# happened: an earlier version printed "bound to output SPI-1" unconditionally,
+# directly below the warning saying it had not been able to do it.
+TOUCH_MAPPED=no
 TARGET_USER=""
 
 # The cyberdeck is driven from an external USB keyboard. squeekboard -- the
@@ -289,6 +293,7 @@ write_rc_touch() {
     ' "$RC_XML" > "$RC_XML.lcd35.tmp" && mv -f "$RC_XML.lcd35.tmp" "$RC_XML"
 
     chown -R "$TARGET_USER": "$USER_HOME/.config/labwc"
+    TOUCH_MAPPED=yes
     ok "bound touch input to SPI-1 ($RC_XML)"
 }
 
@@ -473,8 +478,13 @@ echo "Installed:"
 echo "  panel      ILI9486 over SPI at $SPEED Hz, as a DRM display"
 echo "  rotation   transform $TRANSFORM, applied at login"
 echo "  touch      libinput matrix $MATRIX"
-echo "  touch map  bound to output SPI-1, so taps land on the panel even"
-echo "             when a monitor is connected"
+if [ "$TOUCH_MAPPED" = yes ]; then
+    echo "  touch map  bound to output SPI-1, so taps land on the panel even"
+    echo "             when a monitor is connected"
+else
+    echo "  touch map  NOT SET -- see the warning above. With a monitor"
+    echo "             connected, taps will land on it, not on the panel."
+fi
 if [ "$DISABLE_OSK" = yes ]; then
     echo "  keyboard   on-screen keyboard off, use the USB keyboard"
 else
