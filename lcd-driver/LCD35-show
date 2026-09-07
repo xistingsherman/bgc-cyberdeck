@@ -251,6 +251,9 @@ strip_config_block() {
 strip_rc_block() {
     [ -f "$RC_XML" ] || return 0
     sed -i '\|^[[:space:]]*<!-- LCD35-show begin -->|,\|^[[:space:]]*<!-- LCD35-show end -->|d' "$RC_XML"
+    # And LCD35-show-pi4b's, for the same reason strip_config_block removes
+    # its config.txt block: only one script should own the touch mapping.
+    sed -i '\|^[[:space:]]*<!-- LCD35-show-pi4b begin -->|,\|^[[:space:]]*<!-- LCD35-show-pi4b end -->|d' "$RC_XML"
 }
 
 write_rc_touch() {

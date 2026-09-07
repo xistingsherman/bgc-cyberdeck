@@ -107,10 +107,13 @@ they are:
 - A stray file named `13.1` appearing in the directory -- same thing with `>`,
   which dash took as **output redirection** and so created the file.
 
-`LCD35-show` now refuses to run under dash and says so in one line.
-`LCD35-show-pi4b` does not have that guard yet, so on a Pi 4 the failure still
-looks like the wall of syntax errors above. Either way, run them as
-`sudo ./LCD35-show` / `sudo ./LCD35-show-pi4b`.
+Both scripts now refuse to run under dash and say so in one line instead:
+
+```
+run this with bash, not sh: sudo ./LCD35-show
+```
+
+Run them as `sudo ./LCD35-show` or `sudo ./LCD35-show-pi4b`.
 
 ---
 
@@ -189,11 +192,10 @@ Both scripts guard against this: their block opens with `[all]` and includes its
 own `dtparam=spi=on`, which overrides a commented-out one earlier in the file. If
 you add overlay lines by hand, write `[all]` above them.
 
-`LCD35-show` also strips **both** scripts' blocks before writing its own, so a
-card that has had `LCD35-show-pi4b` run on it cannot end up with two
-`dtoverlay=piscreen` lines. This is one-way: `LCD35-show-pi4b` only removes its
-own block, so if you go from the Pi 5 script to the Pi 4 one, check `config.txt`
-by hand.
+Each script also strips **both** scripts' blocks -- from `config.txt` and from
+`rc.xml` -- before writing its own. Moving an SD card between a Pi 4 and a Pi 5
+and re-running therefore cannot leave two `dtoverlay=piscreen` lines or two
+`<touch>` elements fighting each other.
 
 ---
 
@@ -220,8 +222,8 @@ panel's output:
 <touch deviceName="ADS7846 Touchscreen" mapToOutput="SPI-1" mouseEmulation="no"/>
 ```
 
-`LCD35-show` writes this for you. `LCD35-show-pi4b` does not, so on a Pi 4 it
-still has to be added by hand.
+Both scripts write this for you. It is read when the compositor starts, so log
+out and back in after installing -- it does not apply live.
 
 Two things make that edit less simple than it looks, and both fail silently:
 
@@ -235,9 +237,6 @@ Two things make that edit less simple than it looks, and both fail silently:
   something like `<!-- --- mine --- -->` makes libxml2 reject the entire file,
   and labwc falls back to built-in defaults -- losing every setting in it, not
   just yours.
-
-`<touch>` is read when the compositor starts, so log out and back in. It does
-not apply live.
 
 ### Taps land in the wrong place
 
